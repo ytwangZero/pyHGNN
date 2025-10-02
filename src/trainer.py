@@ -35,7 +35,7 @@ class TrainConfig:
     grad_clip: float = 1.0
     monitor: str = "val_L_edge"      # or "val_AUC_fm" / "val_AP_fm" (case-insensitive)
     minimize: bool = True             # if monitor is loss -> True; if AUC/AP -> False
-    val_ratio: float = 0.1
+    val_ratio: float = 0.2
     seed: int = 42
 
     # Model hparams
@@ -379,18 +379,68 @@ def run_training(npz_path: str, out_dir: str, cfg: Optional[TrainConfig] = None)
         import pandas as pd
         mm_scores_df = pd.DataFrame(rows, columns=["metabolite_id_src", "metabolite_id_dst", "edge_score"])
 
-    # Embeddings -> numpy for easy saving
+    # Embeddings
     emb_dict = {k: v.detach().cpu().numpy() for k, v in out_final.items()}
 
-    # Optional save
+
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    np.save(out_dir / "emb_feature.npy", emb_dict['feature'])
-    np.save(out_dir / "emb_metabolite.npy", emb_dict['metabolite'])
+
+    df_f = pd.DataFrame(emb_dict['feature'])
+    df_f.insert(0, "feature_id", id_lists["feature"])
+    df_f.to_csv(out_dir / "emb_feature.csv", index=False)
+
+    df_m = pd.DataFrame(emb_dict['metabolite'])
+    df_m.insert(0, "metabolite_id", id_lists["metabolite"])
+    df_m.to_csv(out_dir / "emb_metabolite.csv", index=False)
+
     if fm_scores_df is not None:
         fm_scores_df.to_csv(out_dir / "fm_edge_scores.csv", index=False)
     if mm_scores_df is not None:
         mm_scores_df.to_csv(out_dir / "mm_edge_scores.csv", index=False)
+
+# ------------------------------------------------------------------------------------------------------------------------------------
+    print("DEBUG att:", model.get_last_attention() is not None)
+
+    # === NEW: 导出真正的 HGT 注意力 (α) ===
+    att_pack = model.get_last_attention()
+    if att_pack is not None:
+        att_dict = att_pack['att']
+        eidx_dict = att_pack['edge_index']
+        offsets = att_pack['offsets']
+
+    def _export_att(rel_key, ids_src, ids_dst, fname):
+        if rel_key is None or rel_key not in att_dict:
+            return None
+        alpha = att_dict[rel_key].detach().cpu()          # [E, H]
+
+        # 用原始传入的 canonical edge_index（local 下标，和 ids_* 一致）
+        ei_canon = edge_index_full[rel_key].detach().cpu()  # [2, E]
+        # 保险检查：两者边数一致
+        if alpha.size(0) != ei_canon.size(1):
+            print(f"[WARN] attention rows ({alpha.size(0)}) != edges ({ei_canon.size(1)}) for {rel_key}")
+        src_local = ei_canon[0].numpy()
+        dst_local = ei_canon[1].numpy()
+
+        # 多头聚合（可改成保存每个 head）
+        w = alpha.mean(dim=1).numpy()
+
+        rows = [(ids_src[int(i)], ids_dst[int(j)], float(s)) for s, i, j in zip(w, src_local, dst_local)]
+        import pandas as pd
+        df = pd.DataFrame(rows, columns=[f"{rel_key[0]}_id", f"{rel_key[2]}_id", "att_weight"])
+        df.to_csv(out_dir / fname, index=False)
+        return df
+
+
+    # feature → metabolite
+    if rel_keys['fm'] is not None:
+        _export_att(rel_keys['fm'], id_lists['feature'], id_lists['metabolite'], "fm_attention.csv")
+
+    # metabolite ↔ metabolite
+    if rel_keys['mm'] is not None:
+        _export_att(rel_keys['mm'], id_lists['metabolite'], id_lists['metabolite'], "mm_attention.csv")
+# ------------------------------------------------------------------------------------------------------------------------------------
+
 
     return {
         'best_epoch': stopper.best_epoch if stopper.best_epoch != -1 else cfg.epochs,
